@@ -6,8 +6,9 @@ from dataclasses import dataclass
 
 
 # Attendance and tracking. Identities are ephemeral labels for one process only.
-PRESENCE_FRAME_THRESHOLD = 15
-MAX_MISSING_FRAMES = 20
+PRESENCE_DURATION_THRESHOLD_SECONDS = 3.0
+MAX_TRACK_GAP_SECONDS = 1.5
+MAX_COUNTED_PRESENCE_GAP_SECONDS = 1.0
 TRACKING_MATCH_DISTANCE_PIXELS = 120.0
 METRICS_LOG_INTERVAL_SECONDS = 5.0
 

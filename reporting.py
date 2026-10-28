@@ -42,15 +42,15 @@ def build_session_pdf(
         leftMargin=0.55 * inch,
         topMargin=0.55 * inch,
         bottomMargin=0.55 * inch,
-        title="Classroom session analytics",
-        author="Multimodel Attendance",
+        title="EduSense AI classroom session analytics",
+        author="EduSense AI",
     )
     styles = getSampleStyleSheet()
     body_style = ParagraphStyle(
         "ReportBody", parent=styles["BodyText"], alignment=TA_LEFT, leading=14
     )
     story = [
-        Paragraph("Classroom Session Analytics", styles["Title"]),
+        Paragraph("EduSense AI — Classroom Session Analytics", styles["Title"]),
         Paragraph(f"Started: {started_at}", body_style),
         Paragraph(f"Audio source: {audio_source}", body_style),
         Spacer(1, 0.18 * inch),
@@ -123,7 +123,14 @@ def build_session_pdf(
 
     attendance_columns = [
         column
-        for column in ("profile_id", "status", "cumulative_frames", "first_seen_at", "last_seen_at")
+        for column in (
+            "profile_id",
+            "status",
+            "observed_duration_seconds",
+            "presence_threshold_seconds",
+            "first_seen_at",
+            "last_seen_at",
+        )
         if column in attendance.columns
     ]
     attendance_rows = [attendance_columns]

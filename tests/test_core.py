@@ -8,7 +8,9 @@ import sys
 import tempfile
 import unittest
 import wave
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -32,6 +34,7 @@ from analytics_engine import (
     generate_session_analytics,
 )
 from llm_agent import LocalLLMError, LocalTeachingAgent
+from dashboard import run_analysis
 from reporting import build_session_pdf
 from session_store import (
     clear_history,
@@ -43,20 +46,86 @@ from session_store import (
 
 
 class FaceTrackerTests(unittest.TestCase):
-    def test_cumulative_observations_mark_attendance_only_at_threshold(self) -> None:
-        """Removing cumulative presence must keep a participant absent."""
-        tracker = FaceTracker(presence_frame_threshold=3, max_missing_frames=1)
+    def test_observed_duration_marks_attendance_only_after_threshold(self) -> None:
+        """Frame count must not substitute for observed time."""
+        tracker = FaceTracker(
+            presence_duration_threshold_seconds=2.0,
+            max_track_gap_seconds=1.5,
+            max_counted_presence_gap_seconds=0.75,
+        )
         detection = FaceDetection(10, 10, 80, 80, confidence=0.99)
+        started_at = datetime(2026, 10, 24, 9, 0, tzinfo=timezone.utc)
 
-        tracker.update([detection], timestamp="2026-10-24T09:00:00+00:00")
-        tracker.update([detection], timestamp="2026-10-24T09:00:01+00:00")
+        tracker.update([detection], timestamp=started_at)
+        tracker.update([detection], timestamp=started_at + timedelta(seconds=0.5))
         self.assertEqual(tracker.attendance_dataframe().iloc[0]["status"], "Absent")
+        self.assertAlmostEqual(
+            tracker.attendance_dataframe().iloc[0]["observed_duration_seconds"], 0.5
+        )
 
-        tracker.update([], timestamp="2026-10-24T09:00:02+00:00")
-        tracker.update([detection], timestamp="2026-10-24T09:00:03+00:00")
+        tracker.update([], timestamp=started_at + timedelta(seconds=0.75))
+        tracker.update([detection], timestamp=started_at + timedelta(seconds=1.0))
+        tracker.update([detection], timestamp=started_at + timedelta(seconds=1.5))
+        tracker.update([detection], timestamp=started_at + timedelta(seconds=2.0))
         attendance = tracker.attendance_dataframe()
         self.assertEqual(attendance.iloc[0]["status"], "Present")
-        self.assertEqual(int(attendance.iloc[0]["cumulative_frames"]), 3)
+        self.assertEqual(int(attendance.iloc[0]["cumulative_frames"]), 5)
+        self.assertAlmostEqual(attendance.iloc[0]["observed_duration_seconds"], 2.0)
+        self.assertEqual(attendance.iloc[0]["presence_threshold_seconds"], 2.0)
+
+    def test_attendance_duration_is_independent_of_frame_rate(self) -> None:
+        detection = FaceDetection(10, 10, 80, 80, confidence=0.99)
+        started_at = datetime(2026, 10, 24, 9, 0, tzinfo=timezone.utc)
+        results = []
+        for interval in (0.25, 0.5):
+            tracker = FaceTracker(
+                presence_duration_threshold_seconds=1.0,
+                max_track_gap_seconds=1.5,
+                max_counted_presence_gap_seconds=0.75,
+            )
+            frame_count = round(1.0 / interval)
+            for frame_index in range(frame_count + 1):
+                tracker.update(
+                    [detection],
+                    timestamp=started_at + timedelta(seconds=frame_index * interval),
+                )
+            attendance = tracker.attendance_dataframe().iloc[0]
+            results.append((attendance["status"], attendance["observed_duration_seconds"]))
+        self.assertEqual([result[0] for result in results], ["Present", "Present"])
+        self.assertEqual([result[1] for result in results], [1.0, 1.0])
+
+    def test_long_gap_starts_a_new_anonymous_track(self) -> None:
+        tracker = FaceTracker(
+            presence_duration_threshold_seconds=1.0,
+            max_track_gap_seconds=1.0,
+            max_counted_presence_gap_seconds=0.5,
+        )
+        detection = FaceDetection(10, 10, 80, 80, confidence=0.99)
+        started_at = datetime(2026, 10, 24, 9, 0, tzinfo=timezone.utc)
+        tracker.update([detection], timestamp=started_at)
+        tracker.update([detection], timestamp=started_at + timedelta(seconds=0.25))
+        update = tracker.update([detection], timestamp=started_at + timedelta(seconds=1.5))
+        attendance = tracker.attendance_dataframe()
+
+        self.assertEqual(len(attendance.index), 2)
+        self.assertFalse(bool(attendance.iloc[0]["active"]))
+        self.assertEqual(update.assignments.keys(), {"PROFILE-002"})
+        self.assertEqual(attendance.iloc[1]["observed_duration_seconds"], 0.0)
+
+    def test_duplicate_timestamps_do_not_accumulate_presence_time(self) -> None:
+        tracker = FaceTracker(presence_duration_threshold_seconds=0.5)
+        detection = FaceDetection(10, 10, 80, 80, confidence=0.99)
+        timestamp = datetime(2026, 10, 24, 9, 0, tzinfo=timezone.utc)
+        for _ in range(10):
+            tracker.update([detection], timestamp=timestamp)
+
+        attendance = tracker.attendance_dataframe().iloc[0]
+        self.assertEqual(attendance["status"], "Absent")
+        self.assertEqual(attendance["observed_duration_seconds"], 0.0)
+
+    def test_invalid_presence_threshold_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            FaceTracker(presence_duration_threshold_seconds=0)
 
 
 class EngagementTests(unittest.TestCase):
@@ -80,6 +149,14 @@ class EngagementTests(unittest.TestCase):
         self.assertEqual((windows[0].start_seconds, windows[0].end_seconds), (0.0, 1.0))
         self.assertEqual((windows[1].start_seconds, windows[1].end_seconds), (1.0, 2.0))
         self.assertEqual(windows[0].sample.activity_label, "speech_likely")
+
+    def test_invalid_audio_file_has_a_clear_decode_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "bad-audio.wav"
+            audio_path.write_bytes(b"not audio")
+            with patch("librosa.load", side_effect=RuntimeError("decoder failed")):
+                with self.assertRaisesRegex(ValueError, "Audio could not be decoded"):
+                    analyze_audio_file_windows(str(audio_path))
 
     def test_audio_window_selection_tracks_elapsed_time_and_silence(self) -> None:
         first_sample = AudioSample(0.2, -14.0, 0.7, "start", "speech_likely", 0.8)
@@ -446,6 +523,63 @@ class OpenCVRuntimeTests(unittest.TestCase):
             str(Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml")
         )
         self.assertFalse(classifier.empty())
+
+
+class DashboardWorkflowTests(unittest.TestCase):
+    def test_video_workflow_tracks_a_face_and_keeps_missing_audio_unavailable(self) -> None:
+        class Preview:
+            frame = None
+
+            def image(self, frame, **kwargs) -> None:
+                del kwargs
+                self.frame = frame
+
+        class Status:
+            def caption(self, message: str) -> None:
+                self.message = message
+
+        class FixedDetector:
+            def detect(self, frame) -> list[FaceDetection]:
+                del frame
+                return [FaceDetection(12, 12, 24, 24, 0.9, focus_score=60.0)]
+
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = Path(directory) / "session.avi"
+            writer = cv2.VideoWriter(
+                str(video_path),
+                cv2.VideoWriter_fourcc(*"MJPG"),
+                10.0,
+                (64, 64),
+            )
+            if not writer.isOpened():
+                writer.release()
+                self.skipTest("This OpenCV build cannot write MJPG test videos.")
+            for _ in range(40):
+                writer.write(np.zeros((64, 64, 3), dtype=np.uint8))
+            writer.release()
+
+            preview = Preview()
+            status = Status()
+            with patch("dashboard.CascadeFaceDetector", return_value=FixedDetector()):
+                metrics, attendance, payload, last_frame = run_analysis(
+                    source=str(video_path),
+                    frame_limit=40,
+                    audio_windows=None,
+                    media_pipe_model=None,
+                    preview=preview,
+                    status=status,
+                    session_started_at=datetime(2026, 10, 24, 9, 0, tzinfo=timezone.utc),
+                    presence_threshold_seconds=3.0,
+                )
+
+        self.assertEqual(len(metrics.index), 40)
+        self.assertEqual(attendance.iloc[0]["status"], "Present")
+        self.assertGreaterEqual(attendance.iloc[0]["observed_duration_seconds"], 3.0)
+        self.assertTrue(bool(metrics.iloc[-1]["engagement_available"]))
+        self.assertFalse(bool(metrics.iloc[-1]["audio_available"]))
+        self.assertIsNotNone(last_frame)
+        self.assertIsNotNone(preview.frame)
+        self.assertIn("active profiles 1", status.message)
 
 
 if __name__ == "__main__":

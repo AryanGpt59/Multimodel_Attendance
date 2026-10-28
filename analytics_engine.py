@@ -61,7 +61,7 @@ class TrackedFace:
     last_seen_at: str
     cumulative_frames: int = 0
     consecutive_frames: int = 0
-    missing_frames: int = 0
+    observed_duration_seconds: float = 0.0
     movement_pixels: float = 0.0
     status: str = "Absent"
     active: bool = True
@@ -76,18 +76,28 @@ class TrackingUpdate:
 
 
 class FaceTracker:
-    """Centroid tracker with cumulative sustained-presence attendance logic."""
+    """Centroid tracker with time-based, cumulative observed-presence attendance."""
 
     def __init__(
         self,
-        presence_frame_threshold: int = config.PRESENCE_FRAME_THRESHOLD,
-        max_missing_frames: int = config.MAX_MISSING_FRAMES,
+        presence_duration_threshold_seconds: float = config.PRESENCE_DURATION_THRESHOLD_SECONDS,
+        max_track_gap_seconds: float = config.MAX_TRACK_GAP_SECONDS,
+        max_counted_presence_gap_seconds: float = config.MAX_COUNTED_PRESENCE_GAP_SECONDS,
         match_distance_pixels: float = config.TRACKING_MATCH_DISTANCE_PIXELS,
     ) -> None:
-        if presence_frame_threshold < 1:
-            raise ValueError("presence_frame_threshold must be at least one.")
-        self.presence_frame_threshold = presence_frame_threshold
-        self.max_missing_frames = max_missing_frames
+        if presence_duration_threshold_seconds <= 0:
+            raise ValueError("presence_duration_threshold_seconds must be positive.")
+        if max_track_gap_seconds <= 0:
+            raise ValueError("max_track_gap_seconds must be positive.")
+        if not 0 < max_counted_presence_gap_seconds <= max_track_gap_seconds:
+            raise ValueError(
+                "max_counted_presence_gap_seconds must be positive and no greater than max_track_gap_seconds."
+            )
+        if match_distance_pixels <= 0:
+            raise ValueError("match_distance_pixels must be positive.")
+        self.presence_duration_threshold_seconds = float(presence_duration_threshold_seconds)
+        self.max_track_gap_seconds = float(max_track_gap_seconds)
+        self.max_counted_presence_gap_seconds = float(max_counted_presence_gap_seconds)
         self.match_distance_pixels = match_distance_pixels
         self._tracks: Dict[str, TrackedFace] = {}
         self._next_profile_number = 1
@@ -101,11 +111,36 @@ class FaceTracker:
         self._next_profile_number += 1
         return profile_id
 
+    @staticmethod
+    def _normalize_timestamp(timestamp: Optional[str | datetime]) -> datetime:
+        if timestamp is None:
+            value = datetime.now(timezone.utc)
+        elif isinstance(timestamp, datetime):
+            value = timestamp
+        else:
+            try:
+                value = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            except ValueError as error:
+                raise ValueError("timestamp must be an ISO 8601 datetime.") from error
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
     def update(
-        self, detections: Sequence[FaceDetection], timestamp: Optional[str] = None
+        self,
+        detections: Sequence[FaceDetection],
+        timestamp: Optional[str | datetime] = None,
     ) -> TrackingUpdate:
-        """Associate detections and advance attendance state for one video frame."""
-        observed_at = timestamp or utc_now_iso()
+        """Associate a frame and add only short, timestamped observation intervals."""
+        observed_at_time = self._normalize_timestamp(timestamp)
+        observed_at = observed_at_time.isoformat()
+        for track in self._tracks.values():
+            if not track.active:
+                continue
+            last_seen = self._normalize_timestamp(track.last_seen_at)
+            track_age = (observed_at_time - last_seen).total_seconds()
+            if track_age < 0 or track_age > self.max_track_gap_seconds:
+                track.active = False
         active_tracks = [track for track in self._tracks.values() if track.active]
         unmatched_tracks = {track.profile_id for track in active_tracks}
         unmatched_detection_indexes = set(range(len(detections)))
@@ -127,14 +162,17 @@ class FaceTracker:
         for profile_id, detection_index in matched_pairs:
             track = self._tracks[profile_id]
             detection = detections[detection_index]
+            previous_seen_at = self._normalize_timestamp(track.last_seen_at)
+            observed_interval = (observed_at_time - previous_seen_at).total_seconds()
+            if 0 < observed_interval <= self.max_counted_presence_gap_seconds:
+                track.observed_duration_seconds += observed_interval
             movement = self._distance(track.last_center, detection.center)
             track.last_center = detection.center
             track.last_seen_at = observed_at
             track.cumulative_frames += 1
             track.consecutive_frames += 1
-            track.missing_frames = 0
             track.movement_pixels = movement
-            if track.cumulative_frames >= self.presence_frame_threshold:
+            if track.observed_duration_seconds >= self.presence_duration_threshold_seconds:
                 track.status = "Present"
             assignments[profile_id] = detection
 
@@ -149,18 +187,13 @@ class FaceTracker:
                 cumulative_frames=1,
                 consecutive_frames=1,
             )
-            if self.presence_frame_threshold == 1:
-                track.status = "Present"
             self._tracks[profile_id] = track
             assignments[profile_id] = detection
 
         for profile_id in unmatched_tracks:
             track = self._tracks[profile_id]
-            track.missing_frames += 1
             track.consecutive_frames = 0
             track.movement_pixels = 0.0
-            if track.missing_frames > self.max_missing_frames:
-                track.active = False
 
         return TrackingUpdate(tracks=list(self._tracks.values()), assignments=assignments)
 
@@ -170,6 +203,8 @@ class FaceTracker:
             "profile_id",
             "status",
             "cumulative_frames",
+            "observed_duration_seconds",
+            "presence_threshold_seconds",
             "consecutive_frames",
             "first_seen_at",
             "last_seen_at",
@@ -180,6 +215,8 @@ class FaceTracker:
                 "profile_id": track.profile_id,
                 "status": track.status,
                 "cumulative_frames": track.cumulative_frames,
+                "observed_duration_seconds": round(track.observed_duration_seconds, 3),
+                "presence_threshold_seconds": self.presence_duration_threshold_seconds,
                 "consecutive_frames": track.consecutive_frames,
                 "first_seen_at": track.first_seen_at,
                 "last_seen_at": track.last_seen_at,
@@ -436,7 +473,12 @@ def analyze_audio_file(file_path: str) -> AudioSample:
         import librosa
     except ImportError as error:
         raise RuntimeError("Librosa is not installed. Install requirements.txt first.") from error
-    samples, sample_rate = librosa.load(str(source), sr=None, mono=True)
+    try:
+        samples, sample_rate = librosa.load(str(source), sr=None, mono=True)
+    except Exception as error:
+        raise ValueError(
+            "Audio could not be decoded. Use a supported WAV, MP3, FLAC, or OGG file."
+        ) from error
     return analyze_audio_samples(samples, int(sample_rate))
 
 
@@ -455,9 +497,14 @@ def analyze_audio_file_windows(
     except ImportError as error:
         raise RuntimeError("Librosa is not installed. Install requirements.txt first.") from error
 
-    samples, sample_rate = librosa.load(
-        str(source), sr=config.AUDIO_SAMPLE_RATE, mono=True
-    )
+    try:
+        samples, sample_rate = librosa.load(
+            str(source), sr=config.AUDIO_SAMPLE_RATE, mono=True
+        )
+    except Exception as error:
+        raise ValueError(
+            "Audio could not be decoded. Use a supported WAV, MP3, FLAC, or OGG file."
+        ) from error
     samples = np.asarray(samples, dtype=np.float64).reshape(-1)
     window_size = max(1, int(sample_rate * segment_seconds))
     windows: List[AudioWindow] = []

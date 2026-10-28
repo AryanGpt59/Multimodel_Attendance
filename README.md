@@ -2,20 +2,38 @@
 
 EduSense AI is a local classroom video analysis demo. It detects faces, assigns anonymous session-only track labels, estimates observed presence, combines visual signals with optional audio activity, and produces session summaries. It is intended to help a teacher review patterns; it does not measure learning or replace teacher judgment.
 
+**Repository:** [AryanGpt59/Multimodel_Attendance](https://github.com/AryanGpt59/Multimodel_Attendance), forked from [AGENTBATAK/Multimodel_Attendance](https://github.com/AGENTBATAK/Multimodel_Attendance).
+
 ## What is implemented
 
 | Feature | Current implementation |
 |---|---|
-| Face detection | OpenCV Haar cascades; optional local MediaPipe Face Landmarker model for approximate head-pose signals |
+| Face detection | OpenCV Haar cascades; the detector's placeholder confidence is not a calibrated probability. An optional local MediaPipe Face Landmarker model provides approximate head-pose signals. |
 | Identity recognition | Not implemented. Track labels are anonymous and only last for one run. |
-| Attendance | Centroid tracking confirms a profile after 15 observed frames. This is a frame count, not a duration or verified roster identity. |
+| Attendance | Anonymous centroid tracks accumulate short, timestamped observation intervals. A configurable observed-time threshold (3 seconds by default) confirms a profile; long detection gaps do not count toward presence. This is not roster identity. |
 | Audio | Local one-second audio-file analysis in the dashboard; optional microphone RMS monitoring in the command-line runner. No transcription is performed. |
 | Engagement | Heuristic combination of estimated visual focus, movement, and measured audio activity. A visual detection is required for an engagement score; audio alone is reported as activity. Missing audio is excluded from the score. |
 | Teaching suggestions | Optional local Ollama request using aggregate metrics. The dashboard is opt-in; the command-line runner requests suggestions when its trigger rule fires. |
 | Session history | Local SQLite database, up to 50 sessions. Derived metrics and anonymous track records are saved; raw video and audio are not saved in history. |
-| Reports | Dashboard CSV and PDF downloads; the command-line runner writes metrics and attendance CSV files. |
+| Reports | Separate dashboard metrics and attendance CSV downloads, plus PDF; the command-line runner writes metrics and attendance CSV files, including observed duration and confirmation threshold. |
 
 This repository is a Python and Streamlit application. It does not currently contain the proposed FastAPI/React/WebSocket backend, DeepFace identity recognition, DeepSORT, Groq integration, student roster matching, or teacher accounts. Those are future work, not implemented features.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A[Webcam or local video] --> B[OpenCV face detection and anonymous tracking]
+    C[Optional local audio file or microphone] --> D[Audio activity features]
+    B --> E[Timestamped attendance and visual features]
+    D --> F[Time-aligned multimodal scoring]
+    E --> F
+    F --> G[Streamlit dashboard and local analytics]
+    F --> H[Optional loopback Ollama suggestions]
+    G --> I[Local SQLite history and CSV/PDF exports]
+```
+
+The diagram describes the current Python application. Audio is optional and never transcribed. Ollama receives aggregate counts and numeric metrics only.
 
 ## Requirements
 
@@ -46,10 +64,18 @@ python -m streamlit run dashboard.py
 
 The dashboard can analyze a webcam or an uploaded MP4, AVI, MOV, or MKV video. It analyzes a bounded number of frames (300 by default; configurable up to 1,200), so it is a demonstration workflow rather than continuous full-class monitoring. Optional audio files are WAV, MP3, FLAC, or OGG. Audio starts at the beginning of the webcam run or video timeline; it is not extracted from the video. If no measured audio is available, the score uses visual signals only; if there are no visual detections, no engagement score is reported.
 
+In **Optional inputs and analysis settings**, set the attendance confirmation duration. A profile is confirmed after that amount of observed video time. The tracker adds an observation interval only when the gap between detections is at most 1 second; tracks are retired after 1.5 seconds without a matching detection. These gap rules are in `config.py`.
+
 The command-line runner uses webcam index `0` and attempts to read microphone activity:
 
 ```powershell
 python app.py --source 0
+```
+
+Set a different observed-time threshold when needed:
+
+```powershell
+python app.py --source 0 --presence-seconds 5
 ```
 
 For a prerecorded video, the command-line runner does not extract embedded audio and will not open the microphone. With a webcam source, it attempts microphone activity unless `--no-audio` is set.
@@ -76,7 +102,7 @@ Suggestions are optional and use `http://127.0.0.1:11434/api/generate`. The endp
 
 Video and audio processing runs locally. Audio features are simple signal measurements and a speech-like activity heuristic; speech content is neither recognized nor recorded. The visual focus estimate is approximate head orientation, not attention or emotion recognition. Stillness, silence, and head direction do not establish whether someone is learning. Results should be reviewed in context and must not be used as an automatic high-stakes decision about a student.
 
-Attendance is based on anonymous centroid tracks and a threshold of 15 observed frames. It is not linked to a student roster, and track switches or short-lived detections can affect counts. The dashboard's optional expected class size supports a rough percentage only; it does not verify which students are present.
+Attendance is based on anonymous centroid tracks and a configurable threshold of observed video time (3 seconds by default). It is not linked to a student roster, and track switches or short-lived detections can affect counts. The dashboard's optional expected class size supports a rough percentage only; it does not verify which students are present.
 
 ## Validation
 
@@ -86,7 +112,7 @@ Run the behavioral tests with:
 python -m unittest discover -s tests -v
 ```
 
-The tests cover core tracking and analytics, audio-window alignment, local storage, PDF generation, and the local Ollama response contract. They do not validate detection quality or fairness in real classrooms.
+The tests cover time-based attendance across different frame rates, long detection gaps, core analytics, audio-window alignment, local storage, PDF generation, and the local Ollama response contract. They do not validate detection quality or fairness in real classrooms. Check dependency consistency with `python -m pip check`.
 
 ## Project layout
 
@@ -99,6 +125,6 @@ The tests cover core tracking and analytics, audio-window alignment, local stora
 - `config.py` — thresholds, model tag, and local dashboard settings
 - `tests/test_core.py` — behavioral tests
 
-## Future work
+## Not implemented and future work
 
-Time-based attendance thresholds, reliable roster identity matching, calibrated signal validation, richer error states, broader automated workflow tests, and a deployment/demo strategy remain future work. Any hosted version would need a separate review of camera access, data flows, access control, retention, and consent.
+Reliable roster identity matching, calibrated signal validation, richer error states, broader automated workflow tests, and a deployment/demo strategy remain future work. Teacher performance profiles, emotion recognition, and student leaderboards are intentionally not presented as real features. No hosted demo is published. Any hosted version would need a separate review of camera access, data flows, access control, retention, and consent.

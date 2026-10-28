@@ -81,35 +81,39 @@ def run_analysis(
     preview,
     status,
     session_started_at: Optional[datetime] = None,
+    presence_threshold_seconds: float = config.PRESENCE_DURATION_THRESHOLD_SECONDS,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object], Optional[object]]:
     """Analyze a bounded webcam or video stream fully on the local machine."""
     capture = cv2.VideoCapture(source)
     if not capture.isOpened():
         raise RuntimeError("OpenCV could not open the selected video source.")
 
-    detector = CascadeFaceDetector()
-    tracker = FaceTracker()
-    scorer = EngagementScorer()
-    logger = MetricsLogger(interval_seconds=0.0)
-    movement_history: Dict[str, Deque[float]] = defaultdict(
-        lambda: deque(maxlen=config.MOVEMENT_WINDOW_FRAMES)
-    )
-    landmarker = MediaPipeFaceLandmarker(media_pipe_model) if media_pipe_model else None
-    latest_payload: Dict[str, object] = {}
-    latest_frame = None
-    session_clock_start = monotonic()
-    analysis_started_at = session_started_at or datetime.now(timezone.utc)
-    previous_video_elapsed = -1.0
-    video_fps = capture.get(cv2.CAP_PROP_FPS)
-    if video_fps <= 0:
-        video_fps = 30.0
-
+    landmarker = None
     try:
+        detector = CascadeFaceDetector()
+        tracker = FaceTracker(
+            presence_duration_threshold_seconds=presence_threshold_seconds
+        )
+        scorer = EngagementScorer()
+        logger = MetricsLogger(interval_seconds=0.0)
+        movement_history: Dict[str, Deque[float]] = defaultdict(
+            lambda: deque(maxlen=config.MOVEMENT_WINDOW_FRAMES)
+        )
+        if media_pipe_model:
+            landmarker = MediaPipeFaceLandmarker(media_pipe_model)
+        latest_payload: Dict[str, object] = {}
+        latest_frame = None
+        session_clock_start = monotonic()
+        analysis_started_at = session_started_at or datetime.now(timezone.utc)
+        previous_video_elapsed = -1.0
+        video_fps = capture.get(cv2.CAP_PROP_FPS)
+        if video_fps <= 0:
+            video_fps = 30.0
+
         for frame_index in range(frame_limit):
             captured, frame = capture.read()
             if not captured:
                 break
-            update = tracker.update(detector.detect(frame))
             if isinstance(source, str):
                 video_elapsed = capture.get(cv2.CAP_PROP_POS_MSEC) / 1_000.0
                 if frame_index and video_elapsed <= previous_video_elapsed:
@@ -118,6 +122,8 @@ def run_analysis(
                 elapsed_seconds = max(0.0, video_elapsed)
             else:
                 elapsed_seconds = monotonic() - session_clock_start
+            observed_at = analysis_started_at + timedelta(seconds=elapsed_seconds)
+            update = tracker.update(detector.detect(frame), timestamp=observed_at)
             if audio_windows is not None:
                 active_audio = audio_sample_at(audio_windows, elapsed_seconds)
             else:
@@ -147,7 +153,7 @@ def run_analysis(
                 update.tracks,
                 engagement,
                 active_audio,
-                timestamp=analysis_started_at + timedelta(seconds=elapsed_seconds),
+                timestamp=observed_at,
             )
             latest_payload = metrics_payload(update, engagement, active_audio)
 
@@ -223,6 +229,7 @@ def main() -> None:
     audio_upload = None
     model_upload = None
     frame_limit = config.DASHBOARD_DEFAULT_MAX_FRAMES
+    presence_threshold_seconds = config.PRESENCE_DURATION_THRESHOLD_SECONDS
     expected_participants = st.session_state.session_expected_participants
     ask_agent = False
     save_history = True
@@ -272,6 +279,14 @@ def main() -> None:
                     step=1,
                     key="expected_participants",
                 )
+                presence_threshold_seconds = st.slider(
+                    "Attendance confirmation duration (seconds)",
+                    min_value=0.5,
+                    max_value=30.0,
+                    value=config.PRESENCE_DURATION_THRESHOLD_SECONDS,
+                    step=0.5,
+                    help="A profile is confirmed after this much observed presence; long gaps are not counted as presence.",
+                )
 
                 options_col, history_col = st.columns(2)
                 ask_agent = options_col.checkbox("Request local teaching suggestions", value=False)
@@ -314,6 +329,7 @@ def main() -> None:
                     preview=preview,
                     status=status,
                     session_started_at=datetime.fromisoformat(session_started_at),
+                    presence_threshold_seconds=presence_threshold_seconds,
                 )
                 analysis_status.update(
                     label="Analysis complete",
@@ -360,7 +376,7 @@ def main() -> None:
                             st.session_state.session_suggestions = LocalTeachingAgent().request_suggestions(payload)
                         except LocalLLMError as error:
                             st.warning(f"Local Ollama is unavailable: {error}")
-        except (FileNotFoundError, RuntimeError, ValueError) as error:
+        except (FileNotFoundError, RuntimeError, ValueError, ImportError, cv2.error) as error:
             st.error(str(error))
         finally:
             for temporary_path in temporary_paths:
@@ -397,7 +413,13 @@ def main() -> None:
                     st.markdown("#### Tracked profiles")
                     if has_session and not attendance.empty:
                         st.dataframe(
-                            attendance[["profile_id", "status", "cumulative_frames", "active"]],
+                            attendance[[
+                                "profile_id",
+                                "status",
+                                "observed_duration_seconds",
+                                "presence_threshold_seconds",
+                                "active",
+                            ]],
                             width="stretch",
                             hide_index=True,
                             alt="Anonymous profile tracks and their attendance confirmation status",
@@ -555,11 +577,21 @@ def main() -> None:
                 and summary["present_profiles"] > report_expected_participants
             ):
                 st.warning("More profiles were marked present than the expected class size; review possible duplicate tracks.")
-            download_col, pdf_col, clear_col = st.columns([1.3, 1.4, 1])
+            download_col, attendance_csv_col, pdf_col, clear_col = st.columns(
+                [1.2, 1.25, 1.4, 1]
+            )
             download_col.download_button(
-                "Download CSV data",
+                "Download metrics CSV",
                 data=report_metrics.to_csv(index=False).encode("utf-8"),
                 file_name="session_metrics.csv",
+                mime="text/csv",
+                icon=":material/download:",
+                width="stretch",
+            )
+            attendance_csv_col.download_button(
+                "Download attendance CSV",
+                data=report_attendance.to_csv(index=False).encode("utf-8"),
+                file_name="session_attendance.csv",
                 mime="text/csv",
                 icon=":material/download:",
                 width="stretch",

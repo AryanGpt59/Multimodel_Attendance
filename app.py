@@ -41,6 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-display", action="store_true", help="Run without the OpenCV preview window")
     parser.add_argument("--no-audio", action="store_true", help="Disable microphone monitoring")
     parser.add_argument("--max-frames", type=int, default=0, help="Stop after this many frames; 0 means no limit")
+    parser.add_argument(
+        "--presence-seconds",
+        type=float,
+        default=config.PRESENCE_DURATION_THRESHOLD_SECONDS,
+        help="Observed video seconds required to confirm attendance (default: 3)",
+    )
     parser.add_argument("--log-csv", default="session_metrics.csv", help="Local path for aggregate metrics CSV")
     return parser
 
@@ -108,7 +114,7 @@ def draw_overlay(frame: object, update: TrackingUpdate, engagement: EngagementSc
         track = next(track for track in update.tracks if track.profile_id == profile_id)
         color = (0, 180, 0) if track.status == "Present" else (0, 180, 255)
         cv2.rectangle(frame, (detection.x, detection.y), (detection.x + detection.width, detection.y + detection.height), color, 2)
-        label = f"{profile_id} {track.status} {track.cumulative_frames}f"
+        label = f"{profile_id} {track.status} {track.observed_duration_seconds:.1f}s"
         cv2.putText(frame, label, (detection.x, max(22, detection.y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     state = (
         "INACTIVE"
@@ -130,6 +136,12 @@ def print_suggestions(suggestions: Sequence[TeachingSuggestion]) -> None:
 
 def run(arguments: argparse.Namespace) -> int:
     """Own the capture, analytics, local-agent, and orderly shutdown lifecycle."""
+    if arguments.presence_seconds <= 0:
+        print("Attendance presence duration must be greater than zero seconds.")
+        return 2
+    if arguments.max_frames < 0:
+        print("Maximum frame count cannot be negative.")
+        return 2
     source = parse_source(arguments.source)
     if isinstance(source, str) and not Path(source).is_file():
         print(f"Video file was not found: {source}")
@@ -145,7 +157,9 @@ def run(arguments: argparse.Namespace) -> int:
         capture.release()
         print(f"Unable to initialize offline face detection: {error}")
         return 2
-    tracker = FaceTracker()
+    tracker = FaceTracker(
+        presence_duration_threshold_seconds=arguments.presence_seconds
+    )
     scorer = EngagementScorer()
     logger = MetricsLogger()
     audio_monitor = AudioActivityMonitor()
@@ -173,7 +187,10 @@ def run(arguments: argparse.Namespace) -> int:
     if video_fps <= 0:
         video_fps = 30.0
     previous_video_elapsed = -1.0
-    print("Running locally. Press q in the preview window to stop.")
+    if arguments.no_display:
+        print("Running locally without a preview window.")
+    else:
+        print("Running locally. Press q in the preview window to stop.")
 
     try:
         while True:
@@ -181,16 +198,6 @@ def run(arguments: argparse.Namespace) -> int:
             if not captured:
                 break
             frame_index += 1
-            detections = detector.detect(frame)
-            update = tracker.update(detections)
-            audio = audio_monitor.snapshot() if audio_enabled else AudioSample.unavailable()
-            engagement = calculate_frame_engagement(
-                update,
-                scorer,
-                movement_history,
-                audio.normalized_level,
-                audio_available=audio.available,
-            )
             if isinstance(source, str):
                 video_elapsed = capture.get(cv2.CAP_PROP_POS_MSEC) / 1_000.0
                 if frame_index > 1 and video_elapsed <= previous_video_elapsed:
@@ -199,11 +206,22 @@ def run(arguments: argparse.Namespace) -> int:
                 elapsed_seconds = max(0.0, video_elapsed)
             else:
                 elapsed_seconds = monotonic() - session_clock_start
+            observed_at = session_started_at + timedelta(seconds=elapsed_seconds)
+            detections = detector.detect(frame)
+            update = tracker.update(detections, timestamp=observed_at)
+            audio = audio_monitor.snapshot() if audio_enabled else AudioSample.unavailable()
+            engagement = calculate_frame_engagement(
+                update,
+                scorer,
+                movement_history,
+                audio.normalized_level,
+                audio_available=audio.available,
+            )
             logger.append_if_due(
                 update.tracks,
                 engagement,
                 audio,
-                timestamp=session_started_at + timedelta(seconds=elapsed_seconds),
+                timestamp=observed_at,
             )
 
             now = datetime.now(timezone.utc)
