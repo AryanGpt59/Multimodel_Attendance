@@ -39,6 +39,7 @@ def _initialize(connection: sqlite3.Connection) -> None:
             roster_attendance_rate REAL,
             mean_engagement REAL NOT NULL,
             minimum_engagement REAL NOT NULL,
+            engagement_available INTEGER NOT NULL DEFAULT 1,
             metrics_json TEXT NOT NULL,
             attendance_json TEXT NOT NULL
         )
@@ -51,6 +52,10 @@ def _initialize(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE sessions ADD COLUMN expected_participants INTEGER")
     if "roster_attendance_rate" not in columns:
         connection.execute("ALTER TABLE sessions ADD COLUMN roster_attendance_rate REAL")
+    if "engagement_available" not in columns:
+        connection.execute(
+            "ALTER TABLE sessions ADD COLUMN engagement_available INTEGER NOT NULL DEFAULT 1"
+        )
 
 
 def save_session(
@@ -78,8 +83,9 @@ def save_session(
                     session_id, started_at, audio_source, tracked_profiles,
                     present_profiles, attendance_rate, expected_participants,
                     roster_attendance_rate, mean_engagement, minimum_engagement,
+                    engagement_available,
                     metrics_json, attendance_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -90,8 +96,9 @@ def save_session(
                     summary["track_confirmation_rate"],
                     expected_participants,
                     summary["attendance_rate"],
-                    summary["mean_engagement"],
-                    summary["minimum_engagement"],
+                    summary["mean_engagement"] if summary["mean_engagement"] is not None else 0.0,
+                    summary["minimum_engagement"] if summary["minimum_engagement"] is not None else 0.0,
+                    summary["mean_engagement"] is not None,
                     metrics.to_json(orient="records", date_format="iso"),
                     attendance.to_json(orient="records", date_format="iso"),
                 ),
@@ -121,7 +128,9 @@ def list_sessions(database_path: Optional[Path] = None) -> list[Dict[str, object
                 SELECT session_id, started_at, audio_source, tracked_profiles,
                       present_profiles, attendance_rate AS track_confirmation_rate,
                       expected_participants, roster_attendance_rate,
-                      mean_engagement, minimum_engagement
+                      CASE WHEN engagement_available = 1 THEN mean_engagement ELSE NULL END AS mean_engagement,
+                      CASE WHEN engagement_available = 1 THEN minimum_engagement ELSE NULL END AS minimum_engagement,
+                      engagement_available
                 FROM sessions ORDER BY started_at DESC LIMIT 50
                 """
             ).fetchall()

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 from tempfile import NamedTemporaryFile
@@ -27,7 +27,6 @@ from analytics_engine import (
     analyze_audio_file_windows,
     audio_sample_at,
     generate_session_analytics,
-    simulate_audio_amplitude,
 )
 from app import calculate_frame_engagement, draw_overlay, metrics_payload, should_trigger_agent
 from llm_agent import LocalLLMError, LocalTeachingAgent
@@ -39,6 +38,22 @@ from session_store import (
     save_session,
     update_session_roster,
 )
+
+
+def format_score(value: object, suffix: str = "/100") -> str:
+    """Render unavailable analytics without turning missing data into zero."""
+    if value is None or pd.isna(value):
+        return "Unavailable"
+    return f"{float(value):.1f} {suffix}"
+
+
+def has_measured_audio(metrics: pd.DataFrame, audio_source: str = "") -> bool:
+    """Check that a session contains measured audio rather than a legacy demo signal."""
+    if audio_source == "Demo signal":
+        return False
+    if "audio_available" in metrics.columns:
+        return bool(metrics["audio_available"].fillna(False).astype(bool).any())
+    return audio_source.startswith(("Uploaded audio", "Microphone"))
 
 
 def persist_upload(upload, suffix: str) -> Path:
@@ -65,6 +80,7 @@ def run_analysis(
     media_pipe_model: Optional[str],
     preview,
     status,
+    session_started_at: Optional[datetime] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object], Optional[object]]:
     """Analyze a bounded webcam or video stream fully on the local machine."""
     capture = cv2.VideoCapture(source)
@@ -82,6 +98,7 @@ def run_analysis(
     latest_payload: Dict[str, object] = {}
     latest_frame = None
     session_clock_start = monotonic()
+    analysis_started_at = session_started_at or datetime.now(timezone.utc)
     previous_video_elapsed = -1.0
     video_fps = capture.get(cv2.CAP_PROP_FPS)
     if video_fps <= 0:
@@ -93,27 +110,24 @@ def run_analysis(
             if not captured:
                 break
             update = tracker.update(detector.detect(frame))
-            if audio_windows is not None:
-                if isinstance(source, str):
-                    video_elapsed = capture.get(cv2.CAP_PROP_POS_MSEC) / 1_000.0
-                    if frame_index and video_elapsed <= previous_video_elapsed:
-                        video_elapsed = frame_index / video_fps
-                else:
-                    video_elapsed = monotonic() - session_clock_start
+            if isinstance(source, str):
+                video_elapsed = capture.get(cv2.CAP_PROP_POS_MSEC) / 1_000.0
+                if frame_index and video_elapsed <= previous_video_elapsed:
+                    video_elapsed = frame_index / video_fps
                 previous_video_elapsed = video_elapsed
-                active_audio = audio_sample_at(audio_windows, video_elapsed)
+                elapsed_seconds = max(0.0, video_elapsed)
             else:
-                active_audio = AudioSample(
-                    rms=0.0,
-                    decibels_full_scale=config.AUDIO_SILENCE_DBFS,
-                    normalized_level=simulate_audio_amplitude(frame_index),
-                    captured_at=datetime.now(timezone.utc).isoformat(),
-                )
+                elapsed_seconds = monotonic() - session_clock_start
+            if audio_windows is not None:
+                active_audio = audio_sample_at(audio_windows, elapsed_seconds)
+            else:
+                active_audio = AudioSample.unavailable()
             engagement = calculate_frame_engagement(
                 update,
                 scorer,
                 movement_history,
                 active_audio.normalized_level,
+                audio_available=active_audio.available,
             )
             if landmarker is not None:
                 poses = landmarker.detect_poses(frame)
@@ -127,8 +141,14 @@ def run_analysis(
                         [pose.focus_score for pose in poses],
                         movements,
                         active_audio.normalized_level,
+                        audio_available=active_audio.available,
                     )
-            logger.append_if_due(update.tracks, engagement, active_audio)
+            logger.append_if_due(
+                update.tracks,
+                engagement,
+                active_audio,
+                timestamp=analysis_started_at + timedelta(seconds=elapsed_seconds),
+            )
             latest_payload = metrics_payload(update, engagement, active_audio)
 
             if frame_index % config.DASHBOARD_FRAME_UPDATE_INTERVAL == 0:
@@ -140,8 +160,9 @@ def run_analysis(
                     alt="Most recently analyzed frame with anonymous tracking overlays",
                 )
                 latest_frame = frame.copy()
+                score_text = f"{engagement.score:.1f}/100" if engagement.available else "unavailable"
                 status.caption(
-                    f"Frame {frame_index + 1} · engagement {engagement.score:.1f}/100 · "
+                    f"Frame {frame_index + 1} · engagement {score_text} · "
                     f"active profiles {sum(track.active for track in update.tracks)}"
                 )
     finally:
@@ -174,22 +195,24 @@ def main() -> None:
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    if st.session_state.workspace_view == "Teacher profile":
+        st.session_state.workspace_view = "Session insights"
 
     with st.sidebar:
         st.markdown("## EduSense AI")
         st.caption("Classroom intelligence")
         st.radio(
             "Workspace",
-            ["Live monitor", "Analytics & reports", "Teacher profile"],
+            ["Live monitor", "Analytics & reports", "Session insights"],
             key="workspace_view",
         )
-        st.caption("Local processing. Video and raw audio are not saved.")
+        st.caption("Local processing. Raw media is temporary; session history stores derived metrics only.")
 
     view = st.session_state.workspace_view
     page_details = {
         "Live monitor": ("Classroom monitor", ":material/monitoring:", "Local video analysis with anonymous session-only profiles."),
         "Analytics & reports": ("Analytics & reports", ":material/analytics:", "Review engagement trends and roster-based attendance."),
-        "Teacher profile": ("Session profile", ":material/person_check:", "Reflect on observed signals; this is not an evaluation of teaching quality."),
+        "Session insights": ("Session insights", ":material/insights:", "Reflect on observed signals; this is not an evaluation of teaching quality."),
     }
     title, title_icon, page_caption = page_details[view]
     st.header(title, icon=title_icon)
@@ -290,6 +313,7 @@ def main() -> None:
                     media_pipe_model=model_path,
                     preview=preview,
                     status=status,
+                    session_started_at=datetime.fromisoformat(session_started_at),
                 )
                 analysis_status.update(
                     label="Analysis complete",
@@ -303,7 +327,7 @@ def main() -> None:
                 st.session_state.session_attendance = attendance
                 st.session_state.session_payload = payload
                 st.session_state.session_frame = last_frame
-                audio_source = "Uploaded audio (1-second windows)" if audio_windows is not None else "Demo signal"
+                audio_source = "Uploaded audio (1-second windows)" if audio_windows is not None else "No audio input"
                 st.session_state.session_audio_source = audio_source
                 st.session_state.session_suggestions = []
                 st.session_state.session_started_at = session_started_at
@@ -327,6 +351,9 @@ def main() -> None:
                         movement_score=float(payload["movement_score"]),
                         audio_score=float(payload["audio_score"]),
                         sustained_inactivity=bool(payload["sustained_inactivity"]),
+                        visual_available=bool(payload["visual_available"]),
+                        audio_available=bool(payload["audio_available"]),
+                        available=bool(payload["engagement_available"]),
                     )
                     if should_trigger_agent(current_score, int(payload["active_profiles"])):
                         try:
@@ -394,7 +421,7 @@ def main() -> None:
                     expected_participants=expected_participants,
                 )
                 st.metric("Profiles confirmed", int(current["present_profiles"]))
-                st.metric("Engagement", f"{current['engagement_score']:.1f} / 100")
+                st.metric("Engagement", format_score(current["engagement_score"]))
                 roster_attendance = (
                     f"{summary['present_profiles']}/{expected_participants} "
                     f"({summary['attendance_rate']:.1f}%)"
@@ -412,8 +439,12 @@ def main() -> None:
                 with st.container(border=True):
                     st.markdown("#### Audio activity")
                     st.caption(st.session_state.session_audio_source)
-                    st.markdown(f"**{current['audio_activity']}**")
-                    st.caption(f"{current['audio_dbfs']:.1f} dBFS")
+                    if bool(current.get("audio_available", False)):
+                        st.markdown(f"**{current['audio_activity']}**")
+                        if pd.notna(current["audio_dbfs"]):
+                            st.caption(f"{float(current['audio_dbfs']):.1f} dBFS")
+                    else:
+                        st.caption("Audio is unavailable at this point; this score uses visual signals only.")
             else:
                 st.metric("Profiles confirmed", "--")
                 st.metric("Engagement", "--")
@@ -433,10 +464,8 @@ def main() -> None:
         for record in saved_sessions:
             if has_session and record["session_id"] == st.session_state.session_id:
                 continue
-            label = (
-                f"{record['started_at']} · {float(record['mean_engagement']):.1f} avg · "
-                f"{str(record['session_id'])[:8]}"
-            )
+            average = format_score(record["mean_engagement"], "avg")
+            label = f"{record['started_at']} · {average} · {str(record['session_id'])[:8]}"
             session_options[label] = str(record["session_id"])
 
         if session_options:
@@ -498,7 +527,7 @@ def main() -> None:
                 expected_participants=report_expected_participants,
             )
             top_a, top_b, top_c = st.columns(3)
-            top_a.metric("Mean engagement", f"{summary['mean_engagement']:.1f} / 100")
+            top_a.metric("Mean engagement", format_score(summary["mean_engagement"]))
             top_b.metric(
                 "Confirmed detected IDs",
                 f"{summary['present_profiles']} / {summary['tracked_profiles']}",
@@ -516,6 +545,11 @@ def main() -> None:
                 f"Detected-ID confirmation: {summary['track_confirmation_rate']:.1f}%. "
                 "Short-lived detections can create extra anonymous IDs."
             )
+            if report_audio_source == "Demo signal":
+                st.warning(
+                    "This legacy session included synthetic audio in its engagement score. "
+                    "Treat the score as a demo and do not compare it with measured-audio sessions."
+                )
             if (
                 report_expected_participants is not None
                 and summary["present_profiles"] > report_expected_participants
@@ -569,12 +603,22 @@ def main() -> None:
             with audio_col:
                 with st.container(border=True):
                     st.markdown("#### Audio activity over time")
-                    activity_counts = report_metrics["audio_activity"].value_counts().rename_axis("activity").to_frame("samples")
-                    st.bar_chart(
-                        activity_counts,
-                        height=280,
-                        alt="Counts of audio activity classifications in the selected session",
-                    )
+                    if has_measured_audio(report_metrics, report_audio_source):
+                        activity_counts = report_metrics.loc[
+                            report_metrics["audio_available"].fillna(False).astype(bool)
+                            if "audio_available" in report_metrics.columns
+                            else report_metrics["audio_activity"].ne("unavailable"),
+                            "audio_activity",
+                        ].value_counts().rename_axis("activity").to_frame("samples")
+                        st.bar_chart(
+                            activity_counts,
+                            height=280,
+                            alt="Counts of measured audio activity classifications in the selected session",
+                        )
+                    elif report_audio_source == "Demo signal":
+                        st.caption("Legacy synthetic audio values are excluded from activity reporting.")
+                    else:
+                        st.caption("No measured audio is available for this session.")
             st.markdown("#### Attendance")
             st.dataframe(
                 report_attendance,
@@ -583,7 +627,7 @@ def main() -> None:
                 alt="Attendance status and observed frames for anonymous tracked profiles",
             )
             st.caption(
-                f"Minimum engagement {summary['minimum_engagement']:.1f}/100. Audio source: "
+                f"Minimum engagement {format_score(summary['minimum_engagement'])}. Audio source: "
                 f"{report_audio_source.lower()}."
             )
         else:
@@ -595,6 +639,7 @@ def main() -> None:
         profile_metrics = metrics
         profile_attendance = attendance
         profile_expected_participants = expected_participants
+        profile_audio_source = st.session_state.session_audio_source
         if profile_metrics.empty and saved_sessions:
             latest_record = load_session(str(saved_sessions[0]["session_id"]))
             if latest_record is not None:
@@ -606,6 +651,7 @@ def main() -> None:
                     if saved_expected_participants is not None
                     else None
                 )
+                profile_audio_source = str(latest_record["audio_source"])
         if not profile_metrics.empty:
             summary = generate_session_analytics(
                 profile_attendance,
@@ -614,12 +660,17 @@ def main() -> None:
             )
             focus_average = float(profile_metrics["focus_score"].mean())
             movement_average = float(profile_metrics["movement_score"].mean())
-            audio_average = float(profile_metrics["audio_score"].mean())
+            audio_is_measured = has_measured_audio(profile_metrics, profile_audio_source)
+            audio_average = (
+                float(pd.to_numeric(profile_metrics["audio_score"], errors="coerce").mean())
+                if audio_is_measured and "audio_score" in profile_metrics.columns
+                else None
+            )
             score_col, strengths_col, review_col = st.columns([1, 1, 1], gap="medium")
             with score_col:
                 with st.container(border=True):
                     st.markdown("#### Session engagement")
-                    st.metric("Average score", f"{summary['mean_engagement']:.1f} / 100")
+                    st.metric("Average score", format_score(summary["mean_engagement"]))
                     if summary["attendance_rate"] is not None:
                         st.caption(f"Roster attendance {summary['attendance_rate']:.1f}%")
                     else:
@@ -633,10 +684,16 @@ def main() -> None:
                     components = {
                         "Focus": focus_average,
                         "Movement": movement_average,
-                        "Audio activity": audio_average,
                     }
+                    if audio_average is not None and pd.notna(audio_average):
+                        components["Audio activity"] = audio_average
                     for name, value in sorted(components.items(), key=lambda item: item[1], reverse=True):
-                        st.markdown(f"**{name}**  ·  {value:.1f}/100")
+                        if pd.notna(value):
+                            st.markdown(f"**{name}**  ·  {value:.1f}/100")
+                    if not audio_is_measured:
+                        st.caption("Audio activity was not measured.")
+                    if profile_audio_source == "Demo signal":
+                        st.caption("This legacy engagement score included synthetic audio.")
             with review_col:
                 with st.container(border=True):
                     st.markdown("#### Suggestions")
@@ -644,9 +701,15 @@ def main() -> None:
                         for suggestion in st.session_state.session_suggestions:
                             st.markdown(f"**{suggestion.title}**  \n{suggestion.action}")
                     else:
-                        lowest_signal = min(components, key=components.get)
-                        st.write(f"Review the {lowest_signal.lower()} trend alongside the class context.")
-                        st.caption("Optional suggestions can be requested from a local Ollama model.")
+                        measured_components = {
+                            name: value for name, value in components.items() if pd.notna(value)
+                        }
+                        if measured_components:
+                            lowest_signal = min(measured_components, key=measured_components.get)
+                            st.write(f"Review the {lowest_signal.lower()} trend alongside the class context.")
+                            st.caption("Optional suggestions can be requested from a local Ollama model.")
+                        else:
+                            st.caption("No reliable signal is available for a session suggestion.")
             st.markdown("#### Recent session comparison")
             if saved_sessions:
                 history_cols = st.columns(min(3, len(saved_sessions)))
@@ -654,7 +717,9 @@ def main() -> None:
                     with column:
                         with st.container(border=True):
                             st.markdown(f"**{entry['started_at']}**")
-                            st.markdown(f"{entry['mean_engagement']:.1f} / 100 engagement")
+                            st.markdown(f"{format_score(entry['mean_engagement'])} engagement")
+                            if entry["audio_source"] == "Demo signal":
+                                st.caption("Legacy score includes synthetic audio")
                             if entry["expected_participants"]:
                                 rate = float(entry["roster_attendance_rate"] or 0.0)
                                 st.caption(

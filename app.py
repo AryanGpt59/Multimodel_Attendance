@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import monotonic
 from typing import Deque, Dict, List, Optional, Sequence, Union
 
 import cv2
@@ -21,7 +22,6 @@ from analytics_engine import (
     FaceTracker,
     MetricsLogger,
     TrackingUpdate,
-    simulate_audio_amplitude,
 )
 from llm_agent import LocalLLMError, LocalTeachingAgent, TeachingSuggestion
 
@@ -55,6 +55,7 @@ def calculate_frame_engagement(
     scorer: EngagementScorer,
     movement_history: Dict[str, Deque[float]],
     audio_level: float,
+    audio_available: bool = True,
 ) -> EngagementScore:
     """Aggregate each active profile's visual indicators for the current frame."""
     focus_scores: List[float] = []
@@ -64,7 +65,12 @@ def calculate_frame_engagement(
         track = next(track for track in update.tracks if track.profile_id == profile_id)
         movement_history[profile_id].append(track.movement_pixels)
         all_movement.extend(movement_history[profile_id])
-    return scorer.score(focus_scores, all_movement, audio_level)
+    return scorer.score(
+        focus_scores,
+        all_movement,
+        audio_level,
+        audio_available=audio_available,
+    )
 
 
 def metrics_payload(update: TrackingUpdate, engagement: EngagementScore, audio: AudioSample) -> Dict[str, object]:
@@ -75,17 +81,22 @@ def metrics_payload(update: TrackingUpdate, engagement: EngagementScore, audio: 
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "active_profiles": len(active_tracks),
         "present_profiles": len(present_tracks),
-        "engagement_score": engagement.score,
-        "focus_score": engagement.focus_score,
-        "movement_score": engagement.movement_score,
-        "audio_score": engagement.audio_score,
-        "audio_dbfs": round(audio.decibels_full_scale, 2),
+        "engagement_available": engagement.available,
+        "engagement_score": engagement.score if engagement.available else None,
+        "visual_available": engagement.visual_available,
+        "audio_available": audio.available,
+        "focus_score": engagement.focus_score if engagement.visual_available else None,
+        "movement_score": engagement.movement_score if engagement.visual_available else None,
+        "audio_score": engagement.audio_score if audio.available else None,
+        "audio_dbfs": round(audio.decibels_full_scale, 2) if audio.available else None,
         "sustained_inactivity": engagement.sustained_inactivity,
     }
 
 
 def should_trigger_agent(engagement: EngagementScore, active_profile_count: int) -> bool:
     """Trigger only for meaningful low-engagement or multi-profile inactivity conditions."""
+    if not engagement.available:
+        return False
     low_engagement = engagement.score < config.CRITICAL_ENGAGEMENT_THRESHOLD
     widespread_inactivity = engagement.sustained_inactivity and active_profile_count >= 2
     return low_engagement or widespread_inactivity
@@ -99,8 +110,15 @@ def draw_overlay(frame: object, update: TrackingUpdate, engagement: EngagementSc
         cv2.rectangle(frame, (detection.x, detection.y), (detection.x + detection.width, detection.y + detection.height), color, 2)
         label = f"{profile_id} {track.status} {track.cumulative_frames}f"
         cv2.putText(frame, label, (detection.x, max(22, detection.y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-    state = "INACTIVE" if engagement.sustained_inactivity else "ACTIVE"
-    cv2.putText(frame, f"Engagement: {engagement.score:.1f}/100 ({state})", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    state = (
+        "INACTIVE"
+        if engagement.sustained_inactivity
+        else "ACTIVE"
+        if engagement.available
+        else "UNAVAILABLE"
+    )
+    score_text = f"{engagement.score:.1f}/100" if engagement.available else "unavailable"
+    cv2.putText(frame, f"Engagement: {score_text} ({state})", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
 
 def print_suggestions(suggestions: Sequence[TeachingSuggestion]) -> None:
@@ -131,9 +149,15 @@ def run(arguments: argparse.Namespace) -> int:
     scorer = EngagementScorer()
     logger = MetricsLogger()
     audio_monitor = AudioActivityMonitor()
-    audio_enabled = not arguments.no_audio and audio_monitor.start()
-    if not arguments.no_audio and not audio_enabled:
-        print("Microphone unavailable; using deterministic audio-activity simulation.")
+    audio_enabled = (
+        not arguments.no_audio
+        and isinstance(source, int)
+        and audio_monitor.start()
+    )
+    if isinstance(source, str) and not arguments.no_audio:
+        print("Video-file audio is not extracted; audio will be omitted from the engagement score.")
+    elif not arguments.no_audio and not audio_enabled:
+        print("Microphone unavailable; audio will be omitted from the engagement score.")
 
     agent = LocalTeachingAgent()
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="local-teaching-agent")
@@ -143,6 +167,12 @@ def run(arguments: argparse.Namespace) -> int:
         lambda: deque(maxlen=config.MOVEMENT_WINDOW_FRAMES)
     )
     frame_index = 0
+    session_started_at = datetime.now(timezone.utc)
+    session_clock_start = monotonic()
+    video_fps = capture.get(cv2.CAP_PROP_FPS)
+    if video_fps <= 0:
+        video_fps = 30.0
+    previous_video_elapsed = -1.0
     print("Running locally. Press q in the preview window to stop.")
 
     try:
@@ -153,16 +183,28 @@ def run(arguments: argparse.Namespace) -> int:
             frame_index += 1
             detections = detector.detect(frame)
             update = tracker.update(detections)
-            audio = audio_monitor.snapshot() if audio_enabled else AudioSample(
-                rms=0.0,
-                decibels_full_scale=config.AUDIO_SILENCE_DBFS,
-                normalized_level=simulate_audio_amplitude(frame_index),
-                captured_at=datetime.now(timezone.utc).isoformat(),
-            )
+            audio = audio_monitor.snapshot() if audio_enabled else AudioSample.unavailable()
             engagement = calculate_frame_engagement(
-                update, scorer, movement_history, audio.normalized_level
+                update,
+                scorer,
+                movement_history,
+                audio.normalized_level,
+                audio_available=audio.available,
             )
-            logger.append_if_due(update.tracks, engagement, audio)
+            if isinstance(source, str):
+                video_elapsed = capture.get(cv2.CAP_PROP_POS_MSEC) / 1_000.0
+                if frame_index > 1 and video_elapsed <= previous_video_elapsed:
+                    video_elapsed = (frame_index - 1) / video_fps
+                previous_video_elapsed = video_elapsed
+                elapsed_seconds = max(0.0, video_elapsed)
+            else:
+                elapsed_seconds = monotonic() - session_clock_start
+            logger.append_if_due(
+                update.tracks,
+                engagement,
+                audio,
+                timestamp=session_started_at + timedelta(seconds=elapsed_seconds),
+            )
 
             now = datetime.now(timezone.utc)
             cooldown_elapsed = last_agent_trigger_at is None or (

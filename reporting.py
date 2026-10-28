@@ -14,6 +14,18 @@ from reportlab.lib.units import inch
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 
+def _format_score(value: object) -> str:
+    if value is None or pd.isna(value):
+        return "Unavailable"
+    return f"{float(value):.1f}/100"
+
+
+def _format_cell(value: object) -> str:
+    if value is None or pd.isna(value):
+        return "Unavailable"
+    return str(value)[:24]
+
+
 def build_session_pdf(
     metrics: pd.DataFrame,
     attendance: pd.DataFrame,
@@ -47,8 +59,8 @@ def build_session_pdf(
     kpi_rows = [
         ["Mean engagement", "Minimum engagement", "Confirmed IDs", "Roster attendance"],
         [
-            f"{float(summary['mean_engagement']):.1f}/100",
-            f"{float(summary['minimum_engagement']):.1f}/100",
+            _format_score(summary["mean_engagement"]),
+            _format_score(summary["minimum_engagement"]),
             f"{summary['present_profiles']}/{summary['tracked_profiles']}",
             (
                 f"{summary['present_profiles']}/{summary['expected_participants']} "
@@ -89,7 +101,7 @@ def build_session_pdf(
         sample_rows = sample_rows.iloc[:: max(1, len(sample_rows) // 24)].head(24)
     timeline_rows = [metric_columns]
     timeline_rows.extend(
-        [str(value)[:22] for value in row]
+        [_format_cell(value) for value in row]
         for row in sample_rows.itertuples(index=False, name=None)
     )
     if len(timeline_rows) == 1:
@@ -116,7 +128,7 @@ def build_session_pdf(
     ]
     attendance_rows = [attendance_columns]
     attendance_rows.extend(
-        [str(value)[:24] for value in row]
+        [_format_cell(value) for value in row]
         for row in attendance[attendance_columns].itertuples(index=False, name=None)
     )
     if len(attendance_rows) == 1:

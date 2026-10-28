@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -22,6 +23,7 @@ from analytics_engine import (
     AudioWindow,
     FaceDetection,
     FaceTracker,
+    MetricsLogger,
     analyze_audio_samples,
     analyze_audio_file_windows,
     audio_sample_at,
@@ -29,7 +31,7 @@ from analytics_engine import (
     estimate_head_pose,
     generate_session_analytics,
 )
-from llm_agent import LocalTeachingAgent
+from llm_agent import LocalLLMError, LocalTeachingAgent
 from reporting import build_session_pdf
 from session_store import (
     clear_history,
@@ -89,7 +91,9 @@ class EngagementTests(unittest.TestCase):
 
         self.assertIs(audio_sample_at(windows, 0.5), first_sample)
         self.assertIs(audio_sample_at(windows, 1.5), second_sample)
-        self.assertEqual(audio_sample_at(windows, 2.0).activity_label, "quiet")
+        missing = audio_sample_at(windows, 2.0)
+        self.assertEqual(missing.activity_label, "unavailable")
+        self.assertFalse(missing.available)
 
     def test_symmetric_landmarks_produce_near_centered_head_pose(self) -> None:
         """Swapping a centered face for an asymmetric one must alter focus."""
@@ -129,12 +133,57 @@ class EngagementTests(unittest.TestCase):
         self.assertGreater(score.score, 50.0)
         self.assertFalse(score.sustained_inactivity)
 
+    def test_missing_audio_is_excluded_and_no_signals_are_unavailable(self) -> None:
+        scorer = EngagementScorer(movement_window=3)
+        visual_only = scorer.score(
+            focus_scores=[80.0],
+            movement_values=[0.0, 0.0, 0.0],
+            audio_level=0.0,
+            audio_available=False,
+        )
+        self.assertTrue(visual_only.available)
+        self.assertFalse(visual_only.audio_available)
+        self.assertEqual(visual_only.audio_score, 0.0)
+        self.assertFalse(visual_only.sustained_inactivity)
+        loud_but_missing = scorer.score(
+            [80.0],
+            [0.0, 0.0, 0.0],
+            audio_level=1.0,
+            audio_available=False,
+        )
+        self.assertEqual(loud_but_missing.score, visual_only.score)
+
+        no_signals = scorer.score([], [], 0.0, audio_available=False)
+        self.assertFalse(no_signals.available)
+        audio_only = scorer.score([], [], 0.8, audio_available=True)
+        self.assertTrue(audio_only.audio_available)
+        self.assertFalse(audio_only.visual_available)
+        self.assertFalse(audio_only.available)
+
+    def test_missing_signals_are_not_logged_or_summarized_as_zero_scores(self) -> None:
+        audio = AudioSample.unavailable()
+        score = EngagementScorer().score([], [], 0.0, audio_available=audio.available)
+        logger = MetricsLogger(interval_seconds=0.0)
+        logger.append_if_due([], score, audio)
+        metrics = logger.dataframe()
+
+        self.assertFalse(bool(metrics.iloc[0]["engagement_available"]))
+        self.assertTrue(pd.isna(metrics.iloc[0]["engagement_score"]))
+        self.assertFalse(bool(metrics.iloc[0]["audio_available"]))
+        self.assertTrue(pd.isna(metrics.iloc[0]["audio_score"]))
+        self.assertIsNone(generate_session_analytics(pd.DataFrame(), metrics)["mean_engagement"])
+
     def test_audio_samples_are_reduced_to_a_bounded_activity_measure(self) -> None:
         """Dropping RMS normalization would make optional audio metrics unusable."""
         sample = analyze_audio_samples(np.array([0.5, -0.5, 0.5, -0.5]), sample_rate=16_000)
         self.assertAlmostEqual(sample.rms, 0.5, delta=0.001)
         self.assertAlmostEqual(sample.decibels_full_scale, -6.02, delta=0.05)
         self.assertGreater(sample.normalized_level, 0.85)
+        self.assertTrue(sample.available)
+
+        missing = analyze_audio_samples(np.array([]), sample_rate=16_000)
+        self.assertFalse(missing.available)
+        self.assertEqual(missing.activity_label, "unavailable")
 
     def test_audio_activity_heuristic_separates_quiet_speech_like_and_noise(self) -> None:
         """Treating every loud signal as speech would make noise misleading."""
@@ -217,6 +266,18 @@ class LocalAgentTests(unittest.TestCase):
         self.assertEqual(len(suggestions), 3)
         self.assertEqual(suggestions[0].title, "Think-pair-share")
 
+    def test_local_agent_rejects_non_object_http_responses(self) -> None:
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> list:
+                return []
+
+        agent = LocalTeachingAgent(http_post=lambda *args, **kwargs: Response())
+        with self.assertRaises(LocalLLMError):
+            agent.request_suggestions({"engagement_score": 42.0})
+
 
 class SessionStoreTests(unittest.TestCase):
     def test_sessions_round_trip_and_clear_from_local_database(self) -> None:
@@ -252,6 +313,74 @@ class SessionStoreTests(unittest.TestCase):
             self.assertEqual(clear_history(database_path), 1)
             self.assertEqual(list_sessions(database_path), [])
 
+    def test_unavailable_engagement_is_preserved_as_unavailable_in_history(self) -> None:
+        metrics = pd.DataFrame(
+            [{"engagement_available": False, "engagement_score": None}]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "history.sqlite3"
+            save_session(metrics, pd.DataFrame(), "No audio input", database_path=database_path)
+            summary = list_sessions(database_path)[0]
+
+        self.assertIsNone(summary["mean_engagement"])
+        self.assertFalse(bool(summary["engagement_available"]))
+
+    def test_existing_history_database_gets_the_engagement_availability_column(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "history.sqlite3"
+            connection = sqlite3.connect(database_path)
+            try:
+                connection.execute(
+                    """
+                    CREATE TABLE sessions (
+                        session_id TEXT PRIMARY KEY,
+                        started_at TEXT NOT NULL,
+                        audio_source TEXT NOT NULL,
+                        tracked_profiles INTEGER NOT NULL,
+                        present_profiles INTEGER NOT NULL,
+                        attendance_rate REAL NOT NULL,
+                        expected_participants INTEGER,
+                        roster_attendance_rate REAL,
+                        mean_engagement REAL NOT NULL,
+                        minimum_engagement REAL NOT NULL,
+                        metrics_json TEXT NOT NULL,
+                        attendance_json TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO sessions (
+                        session_id, started_at, audio_source, tracked_profiles,
+                        present_profiles, attendance_rate, expected_participants,
+                        roster_attendance_rate, mean_engagement, minimum_engagement,
+                        metrics_json, attendance_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "existing-session",
+                        "2026-10-24T09:00:00+00:00",
+                        "Uploaded audio",
+                        1,
+                        1,
+                        100.0,
+                        1,
+                        100.0,
+                        72.0,
+                        72.0,
+                        '[{"engagement_score":72.0}]',
+                        "[]",
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            migrated_summary = list_sessions(database_path)[0]
+
+        self.assertAlmostEqual(float(migrated_summary["mean_engagement"]), 72.0)
+        self.assertTrue(bool(migrated_summary["engagement_available"]))
+
 
 class ReportTests(unittest.TestCase):
     def test_session_pdf_is_generated_in_memory(self) -> None:
@@ -282,6 +411,30 @@ class ReportTests(unittest.TestCase):
         document = build_session_pdf(
             metrics, attendance, summary, "2026-10-24 09:00 UTC", "Uploaded audio"
         )
+        self.assertTrue(document.startswith(b"%PDF-"))
+
+    def test_session_pdf_labels_missing_engagement_as_unavailable(self) -> None:
+        document = build_session_pdf(
+            pd.DataFrame(
+                [{
+                    "timestamp": "2026-10-24T09:00:00+00:00",
+                    "engagement_score": None,
+                    "audio_activity": "unavailable",
+                }]
+            ),
+            pd.DataFrame(),
+            {
+                "mean_engagement": None,
+                "minimum_engagement": None,
+                "present_profiles": 0,
+                "tracked_profiles": 0,
+                "expected_participants": None,
+                "attendance_rate": None,
+            },
+            "2026-10-24 09:00 UTC",
+            "No audio input",
+        )
+
         self.assertTrue(document.startswith(b"%PDF-"))
 
 

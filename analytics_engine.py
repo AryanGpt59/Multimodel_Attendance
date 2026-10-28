@@ -356,6 +356,20 @@ class AudioSample:
     captured_at: str
     activity_label: str = "quiet"
     speech_likelihood: float = 0.0
+    available: bool = True
+
+    @classmethod
+    def unavailable(cls, captured_at: Optional[str] = None) -> "AudioSample":
+        """Represent missing audio without presenting it as measured silence."""
+        return cls(
+            rms=0.0,
+            decibels_full_scale=config.AUDIO_SILENCE_DBFS,
+            normalized_level=0.0,
+            captured_at=captured_at or utc_now_iso(),
+            activity_label="unavailable",
+            speech_likelihood=0.0,
+            available=False,
+        )
 
 
 @dataclass(frozen=True)
@@ -404,7 +418,7 @@ def analyze_audio_samples(samples: np.ndarray, sample_rate: int) -> AudioSample:
     if sample_rate <= 0:
         raise ValueError("sample_rate must be positive.")
     if samples.size == 0:
-        return AudioSample(0.0, config.AUDIO_SILENCE_DBFS, 0.0, utc_now_iso())
+        return AudioSample.unavailable()
     normalized_samples = np.asarray(samples, dtype=np.float64).reshape(-1)
     rms = float(np.sqrt(np.mean(np.square(normalized_samples))))
     dbfs = float(20.0 * np.log10(max(rms, 1e-12)))
@@ -462,18 +476,11 @@ def analyze_audio_file_windows(
 def audio_sample_at(
     windows: Sequence[AudioWindow], elapsed_seconds: float
 ) -> AudioSample:
-    """Return the audio features for a time offset, or silence outside the file."""
+    """Return audio features for a time offset, or unavailable outside the file."""
     for window in windows:
         if window.start_seconds <= elapsed_seconds < window.end_seconds:
             return window.sample
-    return AudioSample(
-        rms=0.0,
-        decibels_full_scale=config.AUDIO_SILENCE_DBFS,
-        normalized_level=0.0,
-        captured_at=utc_now_iso(),
-        activity_label="quiet",
-        speech_likelihood=0.0,
-    )
+    return AudioSample.unavailable()
 
 
 class AudioActivityMonitor:
@@ -482,7 +489,7 @@ class AudioActivityMonitor:
     def __init__(self, sample_rate: int = config.AUDIO_SAMPLE_RATE, block_size: int = config.AUDIO_BLOCK_SIZE) -> None:
         self.sample_rate = sample_rate
         self.block_size = block_size
-        self._latest = AudioSample(0.0, config.AUDIO_SILENCE_DBFS, 0.0, utc_now_iso())
+        self._latest = AudioSample.unavailable()
         self._lock = Lock()
         self._stream: object | None = None
         self.available = False
@@ -530,11 +537,6 @@ class AudioActivityMonitor:
                 pass
 
 
-def simulate_audio_amplitude(frame_index: int) -> float:
-    """Deterministic fallback for demos without an accessible microphone."""
-    return clamp(0.35 + (0.25 * math.sin(frame_index / 15.0)), 0.0, 1.0)
-
-
 @dataclass(frozen=True)
 class EngagementScore:
     """A transparent engagement score and its component measurements."""
@@ -544,6 +546,9 @@ class EngagementScore:
     movement_score: float
     audio_score: float
     sustained_inactivity: bool
+    visual_available: bool = True
+    audio_available: bool = True
+    available: bool = True
 
 
 class EngagementScorer:
@@ -564,8 +569,9 @@ class EngagementScorer:
         focus_scores: Iterable[float],
         movement_values: Iterable[float],
         audio_level: float,
+        audio_available: bool = True,
     ) -> EngagementScore:
-        """Score current signals while treating absent faces as no visual evidence."""
+        """Fuse only available signals; missing inputs are not treated as measurements."""
         focus = [clamp(float(value), 0.0, 100.0) for value in focus_scores]
         movement = [max(0.0, float(value)) for value in movement_values]
         focus_score = float(np.mean(focus)) if focus else 0.0
@@ -574,25 +580,41 @@ class EngagementScorer:
         movement_score = clamp(
             (mean_movement / config.MOVEMENT_REFERENCE_PIXELS) * 100.0, 0.0, 100.0
         )
-        sustained_inactivity = bool(recent_movement) and (
+        visual_available = bool(focus or recent_movement)
+        sustained_inactivity = audio_available and visual_available and bool(recent_movement) and (
             len(recent_movement) >= self.movement_window
             and mean_movement <= config.INACTIVITY_MOVEMENT_THRESHOLD_PIXELS
             and focus_score <= config.INACTIVITY_FOCUS_THRESHOLD
             and audio_level * 100.0 <= config.INACTIVITY_AUDIO_THRESHOLD
         )
-        audio_score = clamp(audio_level, 0.0, 1.0) * 100.0
+        audio_score = clamp(audio_level, 0.0, 1.0) * 100.0 if audio_available else 0.0
         movement_contribution = 50.0 + movement_score * 0.1
-        combined = (
-            (focus_score * self.weights.focus)
-            + (movement_contribution * self.weights.movement)
-            + (audio_score * self.weights.audio)
+        visual_weight = self.weights.focus + self.weights.movement
+        available = visual_available and visual_weight > 0
+        available_weight = (
+            visual_weight + (self.weights.audio if audio_available else 0.0)
+            if available
+            else 0.0
         )
+        combined = 0.0
+        if available:
+            visual_score = (
+                focus_score * self.weights.focus
+                + movement_contribution * self.weights.movement
+            ) / visual_weight
+            combined += visual_score * visual_weight
+            if audio_available:
+                combined += audio_score * self.weights.audio
+            combined /= available_weight
         return EngagementScore(
-            score=round(clamp(combined, 0.0, 100.0), 2),
+            score=round(clamp(combined, 0.0, 100.0), 2) if available else 0.0,
             focus_score=round(focus_score, 2),
             movement_score=round(movement_score, 2),
             audio_score=round(audio_score, 2),
             sustained_inactivity=sustained_inactivity,
+            visual_available=visual_available,
+            audio_available=audio_available,
+            available=available,
         )
 
 
@@ -623,13 +645,15 @@ class MetricsLogger:
                 "timestamp": observed_at.isoformat(),
                 "detected_faces": len([face for face in tracked_faces if face.active]),
                 "present_profiles": present_count,
-                "engagement_score": engagement.score,
-                "focus_score": engagement.focus_score,
-                "movement_score": engagement.movement_score,
-                "audio_score": engagement.audio_score,
-                "audio_dbfs": audio.decibels_full_scale,
+                "engagement_available": engagement.available,
+                "engagement_score": engagement.score if engagement.available else None,
+                "focus_score": engagement.focus_score if engagement.visual_available else None,
+                "movement_score": engagement.movement_score if engagement.visual_available else None,
+                "audio_available": audio.available,
+                "audio_score": engagement.audio_score if audio.available else None,
+                "audio_dbfs": audio.decibels_full_scale if audio.available else None,
                 "audio_activity": audio.activity_label,
-                "speech_likelihood": audio.speech_likelihood,
+                "speech_likelihood": audio.speech_likelihood if audio.available else None,
                 "sustained_inactivity": engagement.sustained_inactivity,
             }
         )
@@ -659,15 +683,19 @@ def generate_session_analytics(
         if expected_participants is not None
         else None
     )
-    engagement_column = metrics.get("engagement_score", pd.Series(dtype=float))
-    mean_engagement = float(engagement_column.mean()) if not engagement_column.empty else 0.0
-    minimum_engagement = float(engagement_column.min()) if not engagement_column.empty else 0.0
+    engagement_column = pd.to_numeric(
+        metrics.get("engagement_score", pd.Series(dtype=float)), errors="coerce"
+    ).dropna()
+    if "engagement_available" in metrics.columns:
+        engagement_column = engagement_column[metrics.loc[engagement_column.index, "engagement_available"].fillna(False).astype(bool)]
+    mean_engagement = float(engagement_column.mean()) if not engagement_column.empty else None
+    minimum_engagement = float(engagement_column.min()) if not engagement_column.empty else None
     return {
         "tracked_profiles": tracked_profiles,
         "present_profiles": present_profiles,
         "track_confirmation_rate": round(track_confirmation_rate, 2),
         "expected_participants": expected_participants,
         "attendance_rate": round(attendance_rate, 2) if attendance_rate is not None else None,
-        "mean_engagement": round(mean_engagement, 2),
-        "minimum_engagement": round(minimum_engagement, 2),
+        "mean_engagement": round(mean_engagement, 2) if mean_engagement is not None else None,
+        "minimum_engagement": round(minimum_engagement, 2) if minimum_engagement is not None else None,
     }

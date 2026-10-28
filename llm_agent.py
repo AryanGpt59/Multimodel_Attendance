@@ -90,6 +90,8 @@ class LocalTeachingAgent:
             response = self._http_post(self.endpoint, json=body, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_body = response.json()
+            if not isinstance(response_body, dict):
+                raise LocalLLMError("Ollama response body must be a JSON object.")
             generated_text = response_body.get("response")
             if not isinstance(generated_text, str):
                 raise LocalLLMError("Ollama did not return a textual response.")
